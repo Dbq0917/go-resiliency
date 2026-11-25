@@ -2,6 +2,7 @@
 package semaphore
 
 import (
+	"context"
 	"errors"
 	"time"
 )
@@ -29,6 +30,17 @@ func New(tickets int, timeout time.Duration) *Semaphore {
 // If it cannot after "timeout" amount of time, it returns ErrNoTickets. It is
 // safe to call Acquire concurrently on a single Semaphore.
 func (s *Semaphore) Acquire() error {
+	return s.AcquireCtx(context.Background())
+}
+
+// AcquireCtx tries to acquire a ticket from the semaphore, honouring the given
+// context. If a ticket can be acquired it returns nil. If it cannot after the
+// configured "timeout" amount of time, it returns ErrNoTickets. If the context
+// is cancelled before either of those happens, the wait is interrupted and it
+// returns the context's error (context.Canceled or context.DeadlineExceeded)
+// without consuming a ticket. It is safe to call AcquireCtx concurrently on a
+// single Semaphore.
+func (s *Semaphore) AcquireCtx(ctx context.Context) error {
 	timer := time.NewTimer(s.timeout)
 	select {
 	case s.sem <- struct{}{}:
@@ -36,6 +48,9 @@ func (s *Semaphore) Acquire() error {
 		return nil
 	case <-timer.C:
 		return ErrNoTickets
+	case <-ctx.Done():
+		timer.Stop()
+		return ctx.Err()
 	}
 }
 
