@@ -5,6 +5,16 @@ bumping the major version of this package, which violates the official Golang
 packaging convention around breaking changes. Typically the versions being
 dropped are multiple years old and long unsupported.*
 
+#### Unreleased
+
+ - Adds `Semaphore.NewWithMaxWaiters()` to bound the number of goroutines
+   queued waiting for a ticket; once the queue is full, `Acquire` fails
+   immediately with the new `ErrTooManyWaiters` (distinguishable from
+   `ErrNoTickets`, which still indicates a timeout).
+ - Ticket handoff is now strictly first-come-first-served via an explicit
+   FIFO wait queue.
+ - Adds `Semaphore.Waiters()` to observe the current queue length.
+
 #### Version 1.7.0 (2024-07-19)
 
  - Adds `Retrier.WithSurfaceWorkErrors()` to ask the Retrier to always return

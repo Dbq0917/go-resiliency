@@ -20,3 +20,21 @@ if err := sem.Acquire(); err != nil {
 }
 defer sem.Release()
 ```
+
+Tickets are granted to waiting goroutines first-come-first-served. To keep a
+slow downstream from piling up unbounded numbers of queued goroutines, the
+wait queue can optionally be bounded:
+
+```go
+sem := semaphore.NewWithMaxWaiters(3, 1*time.Second, 100)
+
+if err := sem.Acquire(); err != nil {
+	if err == semaphore.ErrTooManyWaiters {
+		// queue full: rejected immediately, back off
+	} else {
+		// semaphore.ErrNoTickets: waited and timed out, maybe retry
+	}
+	return err
+}
+defer sem.Release()
+```
