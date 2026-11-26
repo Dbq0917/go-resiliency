@@ -1,6 +1,7 @@
 package batcher
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -155,6 +156,103 @@ func TestBatcherMultipleBatches(t *testing.T) {
 
 	if iters != 5 {
 		t.Error("Wrong number of iters:", iters)
+	}
+}
+
+func TestBatcherMaxBatchSize(t *testing.T) {
+	const (
+		maxBatchSize = 8
+		total        = 40
+		timeout      = time.Second
+	)
+
+	var lock sync.Mutex
+	var batchSizes []int
+
+	b := New(timeout, func(params []interface{}) error {
+		lock.Lock()
+		batchSizes = append(batchSizes, len(params))
+		lock.Unlock()
+		return nil
+	}).WithMaxBatchSize(maxBatchSize)
+
+	start := time.Now()
+	firstReturn := make(chan time.Duration, 1)
+	errs := make(chan error, total)
+	wg := &sync.WaitGroup{}
+
+	for i := 0; i < total; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if err := b.Run(i); err != nil {
+				errs <- err
+				return
+			}
+
+			select {
+			case firstReturn <- time.Since(start):
+			default:
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+
+	lock.Lock()
+	sizes := append([]int(nil), batchSizes...)
+	lock.Unlock()
+
+	if len(sizes) == 0 {
+		t.Fatal("doWork was not called")
+	}
+
+	var processed, shortBatches int
+	for _, size := range sizes {
+		if size > maxBatchSize {
+			t.Errorf("batch size %v exceeds limit %v", size, maxBatchSize)
+		}
+		if size < maxBatchSize {
+			shortBatches++
+		}
+		processed += size
+	}
+
+	if processed != total {
+		t.Errorf("expected %v calls to be processed, got %v", total, processed)
+	}
+	if shortBatches > 1 {
+		t.Errorf("concurrent calls were split into too many small batches: %v", sizes)
+	}
+
+	select {
+	case elapsed := <-firstReturn:
+		if elapsed >= timeout/2 {
+			t.Errorf("first call returned after %v, expected it to return early", elapsed)
+		}
+	default:
+		t.Fatal("no call returned")
+	}
+}
+
+func TestBatcherRunCtxTimeout(t *testing.T) {
+	b := New(time.Second, returnsSuccess)
+	defer b.Shutdown(true)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := b.RunCtx(ctx, nil)
+	if err != context.DeadlineExceeded {
+		t.Errorf("expected context.DeadlineExceeded, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed >= 200*time.Millisecond {
+		t.Errorf("RunCtx waited too long before returning: %v", elapsed)
 	}
 }
 

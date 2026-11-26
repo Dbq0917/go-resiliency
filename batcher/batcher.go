@@ -2,6 +2,7 @@
 package batcher
 
 import (
+	"context"
 	"sync"
 	"time"
 )
@@ -13,14 +14,16 @@ type work struct {
 
 // Batcher implements the batching resiliency pattern
 type Batcher struct {
-	timeout   time.Duration
-	prefilter func(interface{}) error
+	timeout      time.Duration
+	maxBatchSize int
+	prefilter    func(interface{}) error
 
 	lock         sync.Mutex
-	submit       chan *work
+	pending      []*work
 	doWork       func([]interface{}) error
 	batchCounter sync.WaitGroup
 	flushTimer   *time.Timer
+	batchID      uint64
 }
 
 // New constructs a new batcher that will batch all calls to Run that occur within
@@ -34,14 +37,40 @@ func New(timeout time.Duration, doWork func([]interface{}) error) *Batcher {
 	}
 }
 
+// WithMaxBatchSize caps the number of parameters passed to doWork in a single
+// invocation. A batch is flushed as soon as it reaches this size rather than
+// waiting for the timeout to expire. A value less than or equal to zero means
+// no limit. This option cannot safely be changed once Run has been invoked.
+func (b *Batcher) WithMaxBatchSize(size int) *Batcher {
+	b.maxBatchSize = size
+	return b
+}
+
+// SetMaxBatchSize is an alias for WithMaxBatchSize.
+func (b *Batcher) SetMaxBatchSize(size int) *Batcher {
+	return b.WithMaxBatchSize(size)
+}
+
 // Run runs the work function with the given parameter, possibly
 // including it in a batch with other calls to Run that occur within the
 // specified timeout. It is safe to call Run concurrently on the same batcher.
 func (b *Batcher) Run(param interface{}) error {
+	return b.RunCtx(context.Background(), param)
+}
+
+// RunCtx is like Run, but stops waiting for the batch to finish if ctx is
+// cancelled or its deadline expires. The work may still be included in a batch
+// that executes later; RunCtx only controls how long the caller waits.
+// It is safe to call RunCtx concurrently on the same batcher.
+func (b *Batcher) RunCtx(ctx context.Context, param interface{}) error {
 	if b.prefilter != nil {
 		if err := b.prefilter(param); err != nil {
 			return err
 		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	if b.timeout == 0 {
@@ -55,7 +84,19 @@ func (b *Batcher) Run(param interface{}) error {
 
 	b.submitWork(w)
 
-	return <-w.future
+	select {
+	case ret := <-w.future:
+		return ret
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// RunWithTimeout is a convenience wrapper around RunCtx.
+func (b *Batcher) RunWithTimeout(param interface{}, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return b.RunCtx(ctx, param)
 }
 
 // Prefilter specifies an optional function that can be used to run initial checks on parameters
@@ -71,35 +112,66 @@ func (b *Batcher) submitWork(w *work) {
 	b.lock.Lock()
 	defer b.lock.Unlock()
 
-	// kick off a new batch if needed
-	if b.submit == nil {
-		b.batchCounter.Add(1)
-		b.submit = make(chan *work, 4)
-		go b.batch(b.submit)
-		b.flushTimer = time.AfterFunc(b.timeout, b.flushCurrentBatch)
+	if len(b.pending) == 0 {
+		b.batchID++
+		batchID := b.batchID
+		b.flushTimer = time.AfterFunc(b.timeout, func() {
+			b.flushTimerFired(batchID)
+		})
 	}
 
-	// then add this work to the current batch
-	b.submit <- w
+	b.pending = append(b.pending, w)
+
+	if b.maxBatchSize > 0 && len(b.pending) >= b.maxBatchSize {
+		b.flushLocked()
+	}
 }
 
-func (b *Batcher) batch(input <-chan *work) {
-	defer b.batchCounter.Done()
+func (b *Batcher) flushTimerFired(batchID uint64) {
+	b.lock.Lock()
+	defer b.lock.Unlock()
 
-	var params []interface{}
-	var futures []chan error
-
-	for work := range input {
-		params = append(params, work.param)
-		futures = append(futures, work.future)
+	if b.batchID != batchID || len(b.pending) == 0 {
+		return
 	}
 
-	ret := b.doWork(params)
+	b.flushLocked()
+}
 
-	for _, future := range futures {
-		future <- ret
-		close(future)
+// flushLocked starts a new batch with the currently pending work. The caller
+// must hold b.lock.
+func (b *Batcher) flushLocked() {
+	if len(b.pending) == 0 {
+		if b.flushTimer != nil {
+			b.flushTimer.Stop()
+			b.flushTimer = nil
+		}
+		return
 	}
+
+	if b.flushTimer != nil {
+		b.flushTimer.Stop()
+		b.flushTimer = nil
+	}
+
+	params := make([]interface{}, len(b.pending))
+	futures := make([]chan error, len(b.pending))
+	for i, w := range b.pending {
+		params[i] = w.param
+		futures[i] = w.future
+	}
+	b.pending = nil
+
+	b.batchCounter.Add(1)
+	go func() {
+		defer b.batchCounter.Done()
+
+		ret := b.doWork(params)
+		for _, future := range futures {
+			future <- ret
+			close(future)
+		}
+	}()
 }
 
 // Shutdown flushes and executes any pending batches. If wait is true, it also waits for the pending batches
@@ -117,16 +189,5 @@ func (b *Batcher) Shutdown(wait bool) {
 func (b *Batcher) flushCurrentBatch() {
 	b.lock.Lock()
 	defer b.lock.Unlock()
-
-	if b.submit == nil {
-		return
-	}
-
-	// stop the timer to avoid spurious flushes and trigger immediate cleanup in case this flush was
-	// triggered manually by a call to Shutdown (it has to happen inside the lock, so it can't be done
-	// in the Shutdown method directly)
-	b.flushTimer.Stop()
-
-	close(b.submit)
-	b.submit = nil
+	b.flushLocked()
 }

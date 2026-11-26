@@ -5,6 +5,13 @@ bumping the major version of this package, which violates the official Golang
 packaging convention around breaking changes. Typically the versions being
 dropped are multiple years old and long unsupported.*
 
+#### Unreleased
+
+ - Adds `Batcher.WithMaxBatchSize()` to flush a batch as soon as it reaches a
+   configured number of entries.
+ - Adds `Batcher.RunCtx()` and `Batcher.RunWithTimeout()` so callers can stop
+   waiting for a batch before its collection timeout expires.
+
 #### Version 1.7.0 (2024-07-19)
 
  - Adds `Retrier.WithSurfaceWorkErrors()` to ask the Retrier to always return
